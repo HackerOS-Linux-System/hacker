@@ -1,1 +1,10 @@
+[package]
+name = "hacker-parser"
+version = "0.0.1"
+edition = "2021"
 
+[dependencies]
+
+[lib]
+name = "hacker_parser"
+path = "src/lib.rs"
