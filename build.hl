@@ -1,3 +1,6 @@
 // cargo
+// rustc
+|| H#
 
 > cargo build --release
+> bytes build --release
