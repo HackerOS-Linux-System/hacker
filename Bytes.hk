@@ -1,1 +1,14 @@
+[package]
+-> name        => hacker
+-> version     => 0.0.1
+-> description => H# bindings for hacker_parser (.hacker file parser), statically linked from Rust
+-> author      => HackerOS Team <hackeros068@gmail.com>
+-> license     => MIT
 
+[build]
+-> lang   => h#
+-> entry  => bytes-io/lib.h#
+-> output => build/libhacker
+-> emit   => lib
+
+[deps]
