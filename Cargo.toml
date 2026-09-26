@@ -8,3 +8,4 @@ edition = "2021"
 [lib]
 name = "hacker_parser"
 path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
