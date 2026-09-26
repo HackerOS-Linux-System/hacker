@@ -1,20 +1,11 @@
-//! Parser dla plików .hacker (wersje 1, 2 i 3)
-//!
-//! # Przykład
-//! ```
-//! use hacker_parser::{parse, HackerFile};
-//!
-//! let input = "[ 0.1 ]";
-//! let parsed = parse(input).unwrap();
-//! match parsed {
-//!     HackerFile::V1(data) => println!("v1: {}", data.content),
-//!     _ => {}
-//! }
-//! ```
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+
+/// C-ABI surface consumed by H# via `extern static [rust, "hacker_parser"]`
+/// (see `bytes-io/lib.h#`). Kept in its own module so the pure-Rust API
+/// above stays exactly as it was before this binding was added.
+pub mod ffi;
 
 /// Błędy parsowania
 #[derive(Debug, PartialEq, Eq)]
