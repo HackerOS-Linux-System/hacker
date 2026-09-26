@@ -1,1 +1,206 @@
+extern static [rust, "hacker_parser"] is
+    ;; Parsing / lifetime
+    fn hacker_parse(input: string)      -> int
+    fn hacker_parse_file(path: string)  -> int
+    fn hacker_free(handle: int)
+    fn hacker_free_string(s: string)
 
+    ;; Version tag
+    fn hacker_version(handle: int) -> int
+
+    ;; v1: freeform content
+    fn hacker_v1_content(handle: int) -> string
+
+    ;; v2: header + named sections of values
+    fn hacker_v2_header(handle: int)                              -> string
+    fn hacker_v2_section_count(handle: int)                       -> int
+    fn hacker_v2_section_name(handle: int, index: int)            -> string
+    fn hacker_v2_value_count(handle: int, name: string)           -> int
+    fn hacker_v2_value_at(handle: int, name: string, index: int)  -> string
+
+    ;; v3: header / type / description / file
+    fn hacker_v3_header(handle: int)      -> string
+    fn hacker_v3_type(handle: int)        -> string
+    fn hacker_v3_description(handle: int) -> string
+    fn hacker_v3_file(handle: int)        -> string
+end
+
+;; ── Version tags ─────────────────────────────────────────────────────────
+;; Mirror ../src/ffi.rs's HACKER_VERSION_* constants. Compare `version(h)`
+;; against these instead of hard-coding 1/2/3 at call sites.
+pub fn version_error() -> int is return 0 end
+pub fn version_v1()    -> int is return 1 end
+pub fn version_v2()    -> int is return 2 end
+pub fn version_v3()    -> int is return 3 end
+
+;; ═══════════════════════════════════════════════════════════════════════
+;; Public API
+;; ═══════════════════════════════════════════════════════════════════════
+
+;; ── Parsing / lifetime ───────────────────────────────────────────────────
+
+;; Parses a `.hacker`-format string, auto-detecting v1/v2/v3 (see
+;; hacker_parser::parse's own doc comment — v1 is always the fallback, so
+;; the only real failure is malformed brackets or empty content). Returns
+;; a handle to pass to `version`/`v1_content`/`v2_*`/`v3_*`/`free`, or `0`
+;; if `input` is not valid `.hacker` syntax at all.
+pub fn parse(input: string) -> int is
+    return hacker_parse(input)
+end
+
+;; Reads and parses the `.hacker` file at `path`. Returns `0` on I/O
+;; error (missing file, permissions, ...) as well as on invalid syntax —
+;; the flat ABI can't tell you which, so if you need to know, read the
+;; file yourself first (e.g. with `std -> fs`) and use `parse` instead.
+pub fn parse_file(path: string) -> int is
+    return hacker_parse_file(path)
+end
+
+;; True if `handle` is a live handle from `parse`/`parse_file` (i.e. not
+;; the `0` failure sentinel). Check this before calling any other
+;; accessor with a handle you haven't already validated.
+pub fn is_valid(handle: int) -> bool is
+    return handle != 0
+end
+
+;; Frees a handle returned by `parse`/`parse_file`. Safe to call with `0`
+;; (no-op). Do not use `handle` again afterward, and do not call this
+;; twice on the same non-zero handle — both are undefined behavior on the
+;; Rust side, exactly like a double-`free`/use-after-`free` in C.
+pub fn free(handle: int) is
+    hacker_free(handle)
+end
+
+;; Frees a string returned by ANY accessor in this file (`v1_content`,
+;; `v2_header`, `v2_section_name`, `v2_value_at`, `v3_*`). Safe to call
+;; with an empty string. Same double-free/use-after-free caveat as `free`
+;; above applies here, per string.
+pub fn free_string(s: string) is
+    hacker_free_string(s)
+end
+
+;; 1/2/3 for the parsed version (compare against `version_v1()`/
+;; `version_v2()`/`version_v3()`), or `version_error()` (`0`) for an
+;; invalid handle.
+pub fn version(handle: int) -> int is
+    return hacker_version(handle)
+end
+
+;; True if `handle` holds a v1 (freeform content) file.
+pub fn is_v1(handle: int) -> bool is
+    return version(handle) == version_v1()
+end
+
+;; True if `handle` holds a v2 (header + sections) file.
+pub fn is_v2(handle: int) -> bool is
+    return version(handle) == version_v2()
+end
+
+;; True if `handle` holds a v3 (header/type/description/file) file.
+pub fn is_v3(handle: int) -> bool is
+    return version(handle) == version_v3()
+end
+
+;; ── v1: freeform content ─────────────────────────────────────────────────
+
+;; The raw content string of a v1 file (everything between `[` and `]`).
+;; Empty string if `handle` isn't a v1 file, or is invalid. Free the
+;; result with `free_string` when done.
+pub fn v1_content(handle: int) -> string is
+    return hacker_v1_content(handle)
+end
+
+;; ── v2: header + named sections of values ─────────────────────────────────
+
+;; The header text of a v2 file (everything before the first `name:`
+;; section). Empty string if `handle` isn't a v2 file. Free with
+;; `free_string`.
+pub fn v2_header(handle: int) -> string is
+    return hacker_v2_header(handle)
+end
+
+;; Number of distinct sections in a v2 file. `0` if `handle` isn't a v2
+;; file.
+pub fn v2_section_count(handle: int) -> int is
+    return hacker_v2_section_count(handle)
+end
+
+;; The section name at `index` (0 <= index < v2_section_count(handle)),
+;; in sorted alphabetical order — stable across repeated calls with the
+;; same handle, even though the underlying Rust side stores sections in a
+;; HashMap with no order of its own. Empty string if out of range. Free
+;; with `free_string`.
+pub fn v2_section_name(handle: int, index: int) -> string is
+    return hacker_v2_section_name(handle, index)
+end
+
+;; Every section name in a v2 file, sorted alphabetically, as one H#
+;; array — a convenience over calling `v2_section_name` in a loop
+;; yourself. Each entry is still a fresh string owned by the Rust side:
+;; when you're done with the array (e.g. after printing it), free every
+;; entry with `free_string`, the same as you would for a single
+;; `v2_section_name` call.
+pub fn v2_section_names(handle: int) -> [string] is
+    let mut out: [string] = []
+    let n: int = v2_section_count(handle)
+    let mut i: int = 0
+    while i < n is
+        out.push(v2_section_name(handle, i))
+        i += 1
+    end
+    return out
+end
+
+;; Number of `= value` entries under section `name`. `0` if `handle`
+;; isn't a v2 file, or has no section called `name`.
+pub fn v2_value_count(handle: int, name: string) -> int is
+    return hacker_v2_value_count(handle, name)
+end
+
+;; The value at `index` under section `name`
+;; (0 <= index < v2_value_count(handle, name)). Empty string if the
+;; section doesn't exist or `index` is out of range. Free with
+;; `free_string`.
+pub fn v2_value_at(handle: int, name: string, index: int) -> string is
+    return hacker_v2_value_at(handle, name, index)
+end
+
+;; Every value under section `name`, in file order, as one H# array —
+;; same convenience/ownership contract as `v2_section_names`: free every
+;; entry with `free_string` once you're done with the array.
+pub fn v2_values(handle: int, name: string) -> [string] is
+    let mut out: [string] = []
+    let n: int = v2_value_count(handle, name)
+    let mut i: int = 0
+    while i < n is
+        out.push(v2_value_at(handle, name, i))
+        i += 1
+    end
+    return out
+end
+
+;; ── v3: header / type / description / file ────────────────────────────────
+
+;; The `= header` field of a v3 file. Empty string if `handle` isn't a
+;; v3 file. Free with `free_string`.
+pub fn v3_header(handle: int) -> string is
+    return hacker_v3_header(handle)
+end
+
+;; The `=> type` field of a v3 file. Empty string if `handle` isn't a v3
+;; file. Free with `free_string`.
+pub fn v3_type(handle: int) -> string is
+    return hacker_v3_type(handle)
+end
+
+;; The `-> description` field of a v3 file. Empty string if `handle`
+;; isn't a v3 file. Free with `free_string`.
+pub fn v3_description(handle: int) -> string is
+    return hacker_v3_description(handle)
+end
+
+;; The `--> file` field of a v3 file. Empty string if `handle` isn't a
+;; v3 file. Free with `free_string`.
+pub fn v3_file(handle: int) -> string is
+    return hacker_v3_file(handle)
+end
