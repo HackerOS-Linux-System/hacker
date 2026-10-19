@@ -7,7 +7,7 @@
 
 [build]
 -> lang   => h#
--> entry  => bytes-io/lib.h#
+-> entry  => bit-io/lib.h#
 -> output => build/libhacker
 -> emit   => lib
 
