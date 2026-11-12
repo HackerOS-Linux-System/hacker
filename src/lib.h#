@@ -1,332 +1,784 @@
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
+use "std -> option" from "option"
+use "std -> fs"     from "fs"
+use "std -> sort"   from "sort"
+use "std -> test"   from "test"
 
-/// C-ABI surface consumed by H# via `extern static [rust, "hacker_parser"]`
-/// (see `bytes-io/lib.h#`). Kept in its own module so the pure-Rust API
-/// above stays exactly as it was before this binding was added.
-pub mod ffi;
+;; ═══════════════════════════════════════════════════════════════════════
+;; Types
+;; ═══════════════════════════════════════════════════════════════════════
 
-/// Błędy parsowania
-#[derive(Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// Brak otwierającego '[' lub zamykającego ']'
-    MissingBrackets,
-    /// Pusty plik (brak zawartości między nawiasami)
-    EmptyContent,
-    /// Błąd parsowania wersji 2 (np. brak nagłówka lub sekcji)
-    V2ParseError(String),
-    /// Błąd parsowania wersji 3 (brak wymaganych pól)
-    V3ParseError(String),
-    /// Nieznany format (zawsze można spróbować v1, ale dla kompletności)
-    UnknownFormat,
-    /// Błąd wejścia/wyjścia przy czytaniu pliku
-    IoError(String),
-}
+;; Parse errors (Rust: `ParseError`). Use `error_message` for the text.
+pub enum ParseError is
+    ;; missing the opening `[` or the closing `]`
+    MissingBrackets
+    ;; nothing between the brackets
+    EmptyContent
+    ;; v2 syntax error (no header / bad section ...)
+    V2ParseError(string)
+    ;; v3 syntax error (missing or repeated field ...)
+    V3ParseError(string)
+    ;; unknown format (v1 accepts everything, kept for completeness)
+    UnknownFormat
+    ;; the file could not be read
+    IoError(string)
+end
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::MissingBrackets => write!(f, "Plik musi zaczynać się od '[' i kończyć ']'"),
-            ParseError::EmptyContent => write!(f, "Zawartość między nawiasami jest pusta"),
-            ParseError::V2ParseError(msg) => write!(f, "Błąd parsowania v2: {}", msg),
-            ParseError::V3ParseError(msg) => write!(f, "Błąd parsowania v3: {}", msg),
-            ParseError::UnknownFormat => write!(f, "Nieznany format pliku .hacker"),
-            ParseError::IoError(msg) => write!(f, "Błąd I/O: {}", msg),
-        }
-    }
-}
+;; v1 — free text inside the brackets.
+pub struct HackerV1 is
+    pub content: string
+end
 
-impl std::error::Error for ParseError {}
+;; One `name:` section of a v2 file with its `= value` entries.
+pub struct Section is
+    pub name:   string
+    pub values: [string]
+end
 
-/// Reprezentacja pliku .hacker (dowolna wersja)
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum HackerFile {
-    V1(HackerV1),
-    V2(HackerV2),
-    V3(HackerV3),
-}
+;; v2 — header plus sections. Sections keep the order of their first
+;; appearance; a section that is repeated in the file is merged into one.
+pub struct HackerV2 is
+    pub header:   string
+    pub sections: [Section]
+end
 
-/// Wersja 1 – dowolny ciąg znaków wewnątrz nawiasów
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct HackerV1 {
-    pub content: String,
-}
+;; v3 — four fixed fields. (`type` is spelled `ty`, as in the Rust crate.)
+pub struct HackerV3 is
+    pub header:      string
+    pub ty:          string
+    pub description: string
+    pub file:        string
+end
 
-/// Wersja 2 – nagłówek oraz sekcje z listami wartości
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct HackerV2 {
-    pub header: String,
-    pub sections: HashMap<String, Vec<String>>,
-}
+;; A parsed `.hacker` file of any version (Rust: `HackerFile`).
+pub enum HackerFile is
+    V1(HackerV1)
+    V2(HackerV2)
+    V3(HackerV3)
+end
 
-/// Wersja 3 – cztery konkretne pola: nagłówek, typ, opis, ścieżka pliku
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct HackerV3 {
-    pub header: String,
-    pub ty: String,   // "type" jest słowem kluczowym, używamy "ty"
-    pub description: String,
-    pub file: String,
-}
+;; ═══════════════════════════════════════════════════════════════════════
+;; Small text helpers (they work on bytes, and every cut falls on a character
+;; boundary, so UTF-8 text is never split in the middle)
+;; ═══════════════════════════════════════════════════════════════════════
 
-/// Parsuje napis jako plik .hacker, automatycznie wykrywając wersję.
-pub fn parse(input: &str) -> Result<HackerFile, ParseError> {
-    let trimmed = input.trim();
-    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
-        return Err(ParseError::MissingBrackets);
-    }
-    let content = trimmed[1..trimmed.len() - 1].trim();
-    if content.is_empty() {
-        return Err(ParseError::EmptyContent);
-    }
+;; ASCII whitespace: space, \t, \n, \v, \f, \r
+fn is_ws_byte(c: int) -> bool is
+    return c == 32 || (c >= 9 && c <= 13)
+end
 
-    // Kolejność prób: v2, v3, v1 (v1 zawsze akceptuje)
-    if let Ok(v2) = parse_v2(content) {
-        return Ok(HackerFile::V2(v2));
-    }
-    if let Ok(v3) = parse_v3(content) {
-        return Ok(HackerFile::V3(v3));
-    }
-    // v1 jako fallback
-    Ok(HackerFile::V1(HackerV1 {
-        content: content.to_string(),
-    }))
-}
+;; Byte length (1..3) of the whitespace character that STARTS at byte `i`, or 0
+;; when it is not whitespace. Rust's `str::trim` removes every Unicode
+;; `White_Space` character, so this knows the multi-byte ones as well:
+;; U+0085 U+00A0 U+1680 U+2000..U+200A U+2028 U+2029 U+202F U+205F U+3000.
+fn ws_len_at(s: string, i: int) -> int is
+    let n: int = s.len()
+    let c: int = byte_at(s, i)
+    if is_ws_byte(c) is return 1 end
+    if c == 194 && i + 1 < n is
+        let d: int = byte_at(s, i + 1)
+        if d == 133 || d == 160 is return 2 end
+        return 0
+    end
+    if c == 225 && i + 2 < n is
+        if byte_at(s, i + 1) == 154 && byte_at(s, i + 2) == 128 is return 3 end
+        return 0
+    end
+    if c == 226 && i + 2 < n is
+        let d: int = byte_at(s, i + 1)
+        let f: int = byte_at(s, i + 2)
+        if d == 128 && ((f >= 128 && f <= 138) || f == 168 || f == 169 || f == 175) is return 3 end
+        if d == 129 && f == 159 is return 3 end
+        return 0
+    end
+    if c == 227 && i + 2 < n is
+        if byte_at(s, i + 1) == 128 && byte_at(s, i + 2) == 128 is return 3 end
+        return 0
+    end
+    return 0
+end
 
-/// Parsuje zawartość (bez nawiasów) jako wersję 2.
-fn parse_v2(content: &str) -> Result<HackerV2, ParseError> {
-    let lines: Vec<&str> = content
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
+;; Same, for the whitespace character that ENDS right before byte `b`
+;; (`b` is an exclusive end offset, `b > 0`).
+fn ws_len_ending_at(s: string, b: int) -> int is
+    let c: int = byte_at(s, b - 1)
+    if is_ws_byte(c) is return 1 end
+    if b >= 2 && byte_at(s, b - 2) == 194 && (c == 133 || c == 160) is return 2 end
+    if b >= 3 is
+        let l: int = byte_at(s, b - 3)
+        let m: int = byte_at(s, b - 2)
+        if l == 225 && m == 154 && c == 128 is return 3 end
+        if l == 226 && m == 128 && ((c >= 128 && c <= 138) || c == 168 || c == 169 || c == 175) is return 3 end
+        if l == 226 && m == 129 && c == 159 is return 3 end
+        if l == 227 && m == 128 && c == 128 is return 3 end
+    end
+    return 0
+end
 
-    if lines.is_empty() {
-        return Err(ParseError::V2ParseError("Brak linii".to_string()));
-    }
+;; `str::trim` — strips leading and trailing Unicode whitespace.
+fn trim_str(s: string) -> string is
+    let n: int = s.len()
+    let mut a: int = 0
+    while a < n is
+        let w: int = ws_len_at(s, a)
+        if w == 0 is break end
+        a += w
+    end
+    let mut b: int = n
+    while b > a is
+        let w: int = ws_len_ending_at(s, b)
+        if w == 0 is break end
+        b -= w
+    end
+    if a >= b is return "" end
+    return s[a..b]
+end
 
-    let mut header_lines = Vec::new();
-    let mut sections: HashMap<String, Vec<String>> = HashMap::new();
-    let mut current_section: Option<String> = None;
+fn has_prefix(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
 
-    let mut i = 0;
-    // Najpierw zbieramy nagłówek – wszystkie linie aż do pierwszej kończącej się ':'
-    while i < lines.len() {
-        let line = lines[i];
-        if line.ends_with(':') {
-            break;
-        }
-        // Linia nagłówka nie może zaczynać się od "= " (wartość sekcji)
-        if line.starts_with("= ") {
-            return Err(ParseError::V2ParseError(
-                "Wartość sekcji przed pierwszym nagłówkiem sekcji".to_string(),
-            ));
-        }
-        header_lines.push(line);
-        i += 1;
-    }
+fn has_suffix(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[s.len() - p.len()..s.len()] == p
+end
 
-    let header = header_lines.join("\n");
+;; `str::lines()` — split on \n (a trailing \r is removed later by trim_str)
+fn split_lines(src: string) -> [string] is
+    let mut out: [string] = []
+    let n: int = src.len()
+    let mut pos: int = 0
+    while pos < n is
+        let mut e: int = pos
+        while e < n && byte_at(src, e) != 10 is e += 1 end
+        out.push(src[pos..e])
+        pos = e + 1
+    end
+    return out
+end
 
-    // Parsowanie sekcji
-    while i < lines.len() {
-        let line = lines[i];
-        if line.ends_with(':') {
-            // nowa sekcja
-            let section_name = line[..line.len() - 1].trim().to_string();
-            if section_name.is_empty() {
-                return Err(ParseError::V2ParseError("Pusta nazwa sekcji".to_string()));
-            }
-            current_section = Some(section_name.clone());
-            i += 1;
-        } else if line.starts_with("= ") {
-            // wartość dla bieżącej sekcji
-            let value = line[2..].trim().to_string();
-            if let Some(ref sec) = current_section {
-                sections
-                    .entry(sec.clone())
-                    .or_insert_with(Vec::new)
-                    .push(value);
-            } else {
-                return Err(ParseError::V2ParseError(
-                    "Wartość poza sekcją".to_string(),
-                ));
-            }
-            i += 1;
-        } else {
-            // Linia, która nie jest ani nagłówkiem sekcji, ani wartością – błąd
-            return Err(ParseError::V2ParseError(format!(
-                "Nieoczekiwana linia: {}",
-                line
-            )));
-        }
-    }
+;; the trimmed, non-empty lines of `content`
+fn content_lines(content: string) -> [string] is
+    let raw: [string] = split_lines(content)
+    let mut out: [string] = []
+    for l in raw is
+        let t: string = trim_str(l)
+        if t.len() > 0 is out.push(t) end
+    end
+    return out
+end
 
-    if sections.is_empty() {
-        return Err(ParseError::V2ParseError(
-            "Brak sekcji w pliku v2".to_string(),
-        ));
-    }
+fn join_lines(parts: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < parts.len() is
+        if i > 0 is out += "\n" end
+        out += parts[i]
+        i += 1
+    end
+    return out
+end
 
-    Ok(HackerV2 { header, sections })
-}
+fn index_of_name(names: [string], name: string) -> int is
+    let mut i: int = 0
+    while i < names.len() is
+        if names[i] == name is return i end
+        i += 1
+    end
+    return -1
+end
 
-/// Parsuje zawartość (bez nawiasów) jako wersję 3.
-fn parse_v3(content: &str) -> Result<HackerV3, ParseError> {
-    let lines: Vec<&str> = content
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
+;; ═══════════════════════════════════════════════════════════════════════
+;; Errors
+;; ═══════════════════════════════════════════════════════════════════════
 
-    let mut header = None;
-    let mut ty = None;
-    let mut description = None;
-    let mut file = None;
+;; Human-readable text of an error (Rust: `impl Display for ParseError`).
+;; The messages are the same Polish strings as in the Rust crate.
+pub fn error_message(e: ParseError) -> string is
+    match e is
+        ParseError::MissingBrackets  => is return "Plik musi zaczynać się od '[' i kończyć ']'" end
+        ParseError::EmptyContent     => is return "Zawartość między nawiasami jest pusta" end
+        ParseError::V2ParseError(m)  => is return "Błąd parsowania v2: " + m end
+        ParseError::V3ParseError(m)  => is return "Błąd parsowania v3: " + m end
+        ParseError::UnknownFormat    => is return "Nieznany format pliku .hacker" end
+        ParseError::IoError(m)       => is return "Błąd I/O: " + m end
+    end
+end
 
-    for line in lines {
-        if line.starts_with("= ") {
-            if header.is_some() {
-                return Err(ParseError::V3ParseError(
-                    "Powtórzony nagłówek (=)".to_string(),
-                ));
-            }
-            header = Some(line[2..].trim().to_string());
-        } else if line.starts_with("=> ") {
-            if ty.is_some() {
-                return Err(ParseError::V3ParseError("Powtórzony typ (=>)".to_string()));
-            }
-            ty = Some(line[3..].trim().to_string());
-        } else if line.starts_with("-> ") {
-            if description.is_some() {
-                return Err(ParseError::V3ParseError(
-                    "Powtórzony opis (->)".to_string(),
-                ));
-            }
-            description = Some(line[3..].trim().to_string());
-        } else if line.starts_with("--> ") {
-            if file.is_some() {
-                return Err(ParseError::V3ParseError(
-                    "Powtórzona ścieżka pliku (-->)".to_string(),
-                ));
-            }
-            file = Some(line[4..].trim().to_string());
-        } else {
-            return Err(ParseError::V3ParseError(format!(
-                "Nieoczekiwana linia: {}",
-                line
-            )));
-        }
-    }
+fn v2_err(msg: string) -> option::Result<HackerV2, ParseError> is
+    return option::Result::Err(ParseError::V2ParseError(msg))
+end
 
-    let header = header.ok_or_else(|| ParseError::V3ParseError("Brak nagłówka (= )".to_string()))?;
-    let ty = ty.ok_or_else(|| ParseError::V3ParseError("Brak typu (=> )".to_string()))?;
-    let description = description
-        .ok_or_else(|| ParseError::V3ParseError("Brak opisu (-> )".to_string()))?;
-    let file = file.ok_or_else(|| ParseError::V3ParseError("Brak ścieżki pliku (--> )".to_string()))?;
+fn v3_err(msg: string) -> option::Result<HackerV3, ParseError> is
+    return option::Result::Err(ParseError::V3ParseError(msg))
+end
 
-    Ok(HackerV3 {
-        header,
-        ty,
-        description,
-        file,
-    })
-}
+;; ═══════════════════════════════════════════════════════════════════════
+;; Parsing
+;; ═══════════════════════════════════════════════════════════════════════
 
-/// Parsuje plik o podanej ścieżce.
-pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<HackerFile, ParseError> {
-    let content = fs::read_to_string(path).map_err(|e| ParseError::IoError(e.to_string()))?;
-    parse(&content)
-}
+;; v2: the text between the brackets is a header (every line up to the first
+;; line ending with `:`) followed by `name:` sections holding `= value` lines.
+fn parse_v2(content: string) -> option::Result<HackerV2, ParseError> is
+    let lines: [string] = content_lines(content)
+    if lines.len() == 0 is return v2_err("Brak linii") end
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    ;; header: everything before the first `name:` line
+    let mut header_lines: [string] = []
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = lines[i]
+        if has_suffix(line, ":") is break end
+        if has_prefix(line, "= ") is
+            return v2_err("Wartość sekcji przed pierwszym nagłówkiem sekcji")
+        end
+        header_lines.push(line)
+        i += 1
+    end
+    let header: string = join_lines(header_lines)
 
-    #[test]
-    fn test_v1_simple() {
-        let input = "[ 0.1 ]";
-        let parsed = parse(input).unwrap();
-        match parsed {
-            HackerFile::V1(v) => assert_eq!(v.content, "0.1"),
-            _ => panic!("Powinno być v1"),
-        }
-    }
+    ;; sections. A section only exists once it has its first value, so the
+    ;; values are collected as flat (section index, value) pairs.
+    let mut names: [string] = []
+    let mut entry_sec: [int] = []
+    let mut entry_val: [string] = []
+    let mut current: string = ""
+    let mut has_current: bool = false
 
-    #[test]
-    fn test_v1_multiline() {
-        let input = "[\n  hello\n  world\n]";
-        let parsed = parse(input).unwrap();
-        match parsed {
-            HackerFile::V1(v) => assert_eq!(v.content, "hello\n  world"),
-            _ => panic!("Powinno być v1"),
-        }
-    }
+    while i < lines.len() is
+        let line: string = lines[i]
+        if has_suffix(line, ":") is
+            let section_name: string = trim_str(line[0..line.len() - 1])
+            if section_name.len() == 0 is return v2_err("Pusta nazwa sekcji") end
+            current = section_name
+            has_current = true
+        elsif has_prefix(line, "= ") is
+            let value: string = trim_str(line[2..line.len()])
+            if !has_current is return v2_err("Wartość poza sekcją") end
+            let mut idx: int = index_of_name(names, current)
+            if idx < 0 is
+                names.push(current)
+                idx = names.len() - 1
+            end
+            entry_sec.push(idx)
+            entry_val.push(value)
+        else is
+            return v2_err("Nieoczekiwana linia: " + line)
+        end
+        i += 1
+    end
 
-    #[test]
-    fn test_v2_full() {
-        let input = r#"[ 
- Przyklad
- jadro:
- = xanmod
- = liquorix
- narzedzia:
- = hpm
- = hl
- wersje:
- = 0.1
- = 0.2
- = 1.1
-]"#;
-        let parsed = parse(input).unwrap();
-        match parsed {
-            HackerFile::V2(v2) => {
-                assert_eq!(v2.header, "Przyklad");
-                assert_eq!(v2.sections.get("jadro").unwrap(), &vec!["xanmod", "liquorix"]);
-                assert_eq!(v2.sections.get("narzedzia").unwrap(), &vec!["hpm", "hl"]);
-                assert_eq!(v2.sections.get("wersje").unwrap(), &vec!["0.1", "0.2", "1.1"]);
-            }
-            _ => panic!("Powinno być v2"),
-        }
-    }
+    if names.len() == 0 is return v2_err("Brak sekcji w pliku v2") end
 
-    #[test]
-    fn test_v3_full() {
-        let input = r#"[ 
- = application
- => gui
- -> aplication for cybersecurity
- --> main.hacker
-]"#;
-        let parsed = parse(input).unwrap();
-        match parsed {
-            HackerFile::V3(v3) => {
-                assert_eq!(v3.header, "application");
-                assert_eq!(v3.ty, "gui");
-                assert_eq!(v3.description, "aplication for cybersecurity");
-                assert_eq!(v3.file, "main.hacker");
-            }
-            _ => panic!("Powinno być v3"),
-        }
-    }
+    let mut sections: [Section] = []
+    let mut k: int = 0
+    while k < names.len() is
+        let mut vals: [string] = []
+        let mut j: int = 0
+        while j < entry_val.len() is
+            if entry_sec[j] == k is vals.push(entry_val[j]) end
+            j += 1
+        end
+        sections.push(Section { name: names[k], values: vals })
+        k += 1
+    end
 
-    #[test]
-    fn test_missing_brackets() {
-        let input = "hello";
-        assert!(matches!(parse(input), Err(ParseError::MissingBrackets)));
-    }
+    return option::Result::Ok(HackerV2 { header: header, sections: sections })
+end
 
-    #[test]
-    fn test_empty_content() {
-        let input = "[]";
-        assert!(matches!(parse(input), Err(ParseError::EmptyContent)));
-    }
+;; v3: exactly one each of `= header`, `=> type`, `-> description`, `--> file`
+;; (in any order).
+fn parse_v3(content: string) -> option::Result<HackerV3, ParseError> is
+    let lines: [string] = content_lines(content)
 
-    #[test]
-    fn test_v2_no_sections() {
-        let input = "[ Header ]";
-        // Brak sekcji – powinien spaść do v1
-        let parsed = parse(input).unwrap();
-        assert!(matches!(parsed, HackerFile::V1(_)));
-    }
-}
+    let mut has_header: bool = false
+    let mut has_ty: bool = false
+    let mut has_desc: bool = false
+    let mut has_file: bool = false
+    let mut header: string = ""
+    let mut ty: string = ""
+    let mut description: string = ""
+    let mut file: string = ""
+
+    for line in lines is
+        if has_prefix(line, "= ") is
+            if has_header is return v3_err("Powtórzony nagłówek (=)") end
+            has_header = true
+            header = trim_str(line[2..line.len()])
+        elsif has_prefix(line, "=> ") is
+            if has_ty is return v3_err("Powtórzony typ (=>)") end
+            has_ty = true
+            ty = trim_str(line[3..line.len()])
+        elsif has_prefix(line, "-> ") is
+            if has_desc is return v3_err("Powtórzony opis (->)") end
+            has_desc = true
+            description = trim_str(line[3..line.len()])
+        elsif has_prefix(line, "--> ") is
+            if has_file is return v3_err("Powtórzona ścieżka pliku (-->)") end
+            has_file = true
+            file = trim_str(line[4..line.len()])
+        else is
+            return v3_err("Nieoczekiwana linia: " + line)
+        end
+    end
+
+    if !has_header is return v3_err("Brak nagłówka (= )") end
+    if !has_ty is return v3_err("Brak typu (=> )") end
+    if !has_desc is return v3_err("Brak opisu (-> )") end
+    if !has_file is return v3_err("Brak ścieżki pliku (--> )") end
+
+    return option::Result::Ok(HackerV3 { header: header, ty: ty, description: description, file: file })
+end
+
+;; Parses a string as a `.hacker` file and detects the version on its own
+;; (v2, then v3, then v1 as the always-accepting fallback). The only errors
+;; are `MissingBrackets` and `EmptyContent`.
+pub fn parse(input: string) -> option::Result<HackerFile, ParseError> is
+    let trimmed: string = trim_str(input)
+    if !has_prefix(trimmed, "[") || !has_suffix(trimmed, "]") is
+        return option::Result::Err(ParseError::MissingBrackets)
+    end
+    let content: string = trim_str(trimmed[1..trimmed.len() - 1])
+    if content.len() == 0 is
+        return option::Result::Err(ParseError::EmptyContent)
+    end
+
+    match parse_v2(content) is
+        option::Result::Ok(v2) => is
+            let f2: HackerFile = HackerFile::V2(v2)
+            return option::Result::Ok(f2)
+        end
+        option::Result::Err(_) => is end
+    end
+
+    match parse_v3(content) is
+        option::Result::Ok(v3) => is
+            let f3: HackerFile = HackerFile::V3(v3)
+            return option::Result::Ok(f3)
+        end
+        option::Result::Err(_) => is end
+    end
+
+    let f1: HackerFile = HackerFile::V1(HackerV1 { content: content })
+    return option::Result::Ok(f1)
+end
+
+;; Reads and parses the file at `path`. A file that cannot be read gives
+;; `ParseError::IoError`.
+pub fn parse_file(path: string) -> option::Result<HackerFile, ParseError> is
+    if !fs::is_file(path) is
+        return option::Result::Err(ParseError::IoError("nie można odczytać pliku: " + path))
+    end
+    return parse(fs::read(path))
+end
+
+;; ═══════════════════════════════════════════════════════════════════════
+;; Accessors
+;;
+;; Same names as the old Rust-backed binding, but they take a `HackerFile`
+;; instead of an int handle. Asking a file for a field of another version
+;; gives "" / 0 / an empty array — never an error.
+;; ═══════════════════════════════════════════════════════════════════════
+
+;; 1, 2 or 3 — the version of the file.
+pub fn version(f: HackerFile) -> int is
+    match f is
+        HackerFile::V1(_) => is return 1 end
+        HackerFile::V2(_) => is return 2 end
+        HackerFile::V3(_) => is return 3 end
+    end
+end
+
+pub fn is_v1(f: HackerFile) -> bool is
+    return version(f) == 1
+end
+
+pub fn is_v2(f: HackerFile) -> bool is
+    return version(f) == 2
+end
+
+pub fn is_v3(f: HackerFile) -> bool is
+    return version(f) == 3
+end
+
+;; ── v1 ───────────────────────────────────────────────────────────────────
+
+;; The text between `[` and `]`, trimmed. "" for other versions.
+pub fn v1_content(f: HackerFile) -> string is
+    match f is
+        HackerFile::V1(v) => is return v.content end
+        HackerFile::V2(_) => is return "" end
+        HackerFile::V3(_) => is return "" end
+    end
+end
+
+;; ── v2 ───────────────────────────────────────────────────────────────────
+
+;; The header text (lines before the first section, joined with \n).
+;; "" for other versions.
+pub fn v2_header(f: HackerFile) -> string is
+    match f is
+        HackerFile::V1(_) => is return "" end
+        HackerFile::V2(v) => is return v.header end
+        HackerFile::V3(_) => is return "" end
+    end
+end
+
+;; The sections in order of first appearance. Empty for other versions.
+pub fn v2_sections(f: HackerFile) -> [Section] is
+    let mut out: [Section] = []
+    match f is
+        HackerFile::V1(_) => is end
+        HackerFile::V2(v) => is out = v.sections end
+        HackerFile::V3(_) => is end
+    end
+    return out
+end
+
+;; Number of distinct sections.
+pub fn v2_section_count(f: HackerFile) -> int is
+    let secs: [Section] = v2_sections(f)
+    return secs.len()
+end
+
+;; All section names, sorted alphabetically — a stable order, like the old
+;; binding's `v2_section_names`.
+pub fn v2_section_names(f: HackerFile) -> [string] is
+    let secs: [Section] = v2_sections(f)
+    let mut out: [string] = []
+    for s in secs is out.push(s.name) end
+    if out.len() < 2 is return out end
+    return sort::sort_strings(out)
+end
+
+;; The `index`-th section name in sorted order ("" when out of range).
+pub fn v2_section_name(f: HackerFile, index: int) -> string is
+    let names: [string] = v2_section_names(f)
+    if index < 0 || index >= names.len() is return "" end
+    return names[index]
+end
+
+;; True if the file has a section called `name`.
+pub fn v2_has_section(f: HackerFile, name: string) -> bool is
+    let secs: [Section] = v2_sections(f)
+    for s in secs is
+        if s.name == name is return true end
+    end
+    return false
+end
+
+;; The values of section `name` in file order (empty if there is no such section).
+pub fn v2_values(f: HackerFile, name: string) -> [string] is
+    let secs: [Section] = v2_sections(f)
+    let mut out: [string] = []
+    for s in secs is
+        if s.name == name is out = s.values end
+    end
+    return out
+end
+
+;; Number of `= value` entries under section `name`.
+pub fn v2_value_count(f: HackerFile, name: string) -> int is
+    let vals: [string] = v2_values(f, name)
+    return vals.len()
+end
+
+;; The value at `index` under section `name` ("" when out of range).
+pub fn v2_value_at(f: HackerFile, name: string, index: int) -> string is
+    let vals: [string] = v2_values(f, name)
+    if index < 0 || index >= vals.len() is return "" end
+    return vals[index]
+end
+
+;; ── v3 ───────────────────────────────────────────────────────────────────
+
+;; The `= header` field. "" for other versions.
+pub fn v3_header(f: HackerFile) -> string is
+    match f is
+        HackerFile::V1(_) => is return "" end
+        HackerFile::V2(_) => is return "" end
+        HackerFile::V3(v) => is return v.header end
+    end
+end
+
+;; The `=> type` field. "" for other versions.
+pub fn v3_type(f: HackerFile) -> string is
+    match f is
+        HackerFile::V1(_) => is return "" end
+        HackerFile::V2(_) => is return "" end
+        HackerFile::V3(v) => is return v.ty end
+    end
+end
+
+;; The `-> description` field. "" for other versions.
+pub fn v3_description(f: HackerFile) -> string is
+    match f is
+        HackerFile::V1(_) => is return "" end
+        HackerFile::V2(_) => is return "" end
+        HackerFile::V3(v) => is return v.description end
+    end
+end
+
+;; The `--> file` field. "" for other versions.
+pub fn v3_file(f: HackerFile) -> string is
+    match f is
+        HackerFile::V1(_) => is return "" end
+        HackerFile::V2(_) => is return "" end
+        HackerFile::V3(v) => is return v.file end
+    end
+end
+
+;; ═══════════════════════════════════════════════════════════════════════
+;; Tests — `bit test`. Ports of the Rust tests in lib.rs and ffi.rs.
+;; ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_v1_simple() is
+    match parse("[ 0.1 ]") is
+        option::Result::Ok(f) => is
+            assert_eq(version(f), 1)
+            assert_eq(v1_content(f), "0.1")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_v1_multiline() is
+    match parse("[\n  hello\n  world\n]") is
+        option::Result::Ok(f) => is
+            assert_eq(version(f), 1)
+            assert_eq(v1_content(f), "hello\n  world")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_v2_full() is
+    let input: string = "[ \n Przyklad\n jadro:\n = xanmod\n = liquorix\n narzedzia:\n = hpm\n = hl\n wersje:\n = 0.1\n = 0.2\n = 1.1\n]"
+    match parse(input) is
+        option::Result::Ok(f) => is
+            assert_eq(version(f), 2)
+            assert_eq(v2_header(f), "Przyklad")
+            assert_eq(v2_section_count(f), 3)
+            let jadro: [string] = v2_values(f, "jadro")
+            assert_eq(jadro.len(), 2)
+            assert_eq(jadro[0], "xanmod")
+            assert_eq(jadro[1], "liquorix")
+            let narzedzia: [string] = v2_values(f, "narzedzia")
+            assert_eq(narzedzia.len(), 2)
+            assert_eq(narzedzia[0], "hpm")
+            assert_eq(narzedzia[1], "hl")
+            let wersje: [string] = v2_values(f, "wersje")
+            assert_eq(wersje.len(), 3)
+            assert_eq(wersje[0], "0.1")
+            assert_eq(wersje[1], "0.2")
+            assert_eq(wersje[2], "1.1")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_v3_full() is
+    let input: string = "[ \n = application\n => gui\n -> aplication for cybersecurity\n --> main.hacker\n]"
+    match parse(input) is
+        option::Result::Ok(f) => is
+            assert_eq(version(f), 3)
+            assert_eq(v3_header(f), "application")
+            assert_eq(v3_type(f), "gui")
+            assert_eq(v3_description(f), "aplication for cybersecurity")
+            assert_eq(v3_file(f), "main.hacker")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_missing_brackets() is
+    match parse("hello") is
+        option::Result::Ok(_) => is test::fail("expected MissingBrackets") end
+        option::Result::Err(e) => is
+            assert_eq(error_message(e), "Plik musi zaczynać się od '[' i kończyć ']'")
+        end
+    end
+end
+
+#[test]
+fn test_missing_closing_bracket() is
+    match parse("[ abc") is
+        option::Result::Ok(_) => is test::fail("expected MissingBrackets") end
+        option::Result::Err(e) => is
+            assert_eq(error_message(e), "Plik musi zaczynać się od '[' i kończyć ']'")
+        end
+    end
+end
+
+#[test]
+fn test_empty_content() is
+    match parse("[]") is
+        option::Result::Ok(_) => is test::fail("expected EmptyContent") end
+        option::Result::Err(e) => is
+            assert_eq(error_message(e), "Zawartość między nawiasami jest pusta")
+        end
+    end
+    match parse("[  \n  ]") is
+        option::Result::Ok(_) => is test::fail("expected EmptyContent") end
+        option::Result::Err(e) => is
+            assert_eq(error_message(e), "Zawartość między nawiasami jest pusta")
+        end
+    end
+end
+
+#[test]
+fn test_v2_no_sections_falls_back_to_v1() is
+    match parse("[ Header ]") is
+        option::Result::Ok(f) => is
+            assert_eq(version(f), 1)
+            assert_eq(v1_content(f), "Header")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_v2_section_without_values_falls_back_to_v1() is
+    match parse("[\nHeader\nsekcja:\n]") is
+        option::Result::Ok(f) => is
+            assert_eq(version(f), 1)
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_v2_repeated_section_is_merged() is
+    match parse("[\nH\na:\n= 1\nb:\n= x\na:\n= 2\n]") is
+        option::Result::Ok(f) => is
+            assert_eq(version(f), 2)
+            assert_eq(v2_section_count(f), 2)
+            assert_eq(v2_value_count(f, "a"), 2)
+            assert_eq(v2_value_at(f, "a", 0), "1")
+            assert_eq(v2_value_at(f, "a", 1), "2")
+            assert_eq(v2_value_count(f, "b"), 1)
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_v2_multiline_header_and_crlf() is
+    match parse("[\r\nLinia 1\r\nLinia 2\r\nsekcja:\r\n= wartosc\r\n]") is
+        option::Result::Ok(f) => is
+            assert_eq(version(f), 2)
+            assert_eq(v2_header(f), "Linia 1\nLinia 2")
+            assert_eq(v2_value_at(f, "sekcja", 0), "wartosc")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_v2_section_names_sorted() is
+    match parse("[\nH\nzeta:\n= 1\nalfa:\n= 2\nmika:\n= 3\n]") is
+        option::Result::Ok(f) => is
+            assert_eq(v2_section_count(f), 3)
+            assert_eq(v2_section_name(f, 0), "alfa")
+            assert_eq(v2_section_name(f, 1), "mika")
+            assert_eq(v2_section_name(f, 2), "zeta")
+            assert_eq(v2_section_name(f, 3), "")
+            assert_eq(v2_section_name(f, -1), "")
+            let names: [string] = v2_section_names(f)
+            assert_eq(names.len(), 3)
+            assert_eq(names[0], "alfa")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_v2_unknown_section_and_index() is
+    match parse("[\nH\njadro:\n= xanmod\n]") is
+        option::Result::Ok(f) => is
+            assert_true(v2_has_section(f, "jadro"))
+            assert_false(v2_has_section(f, "brak"))
+            assert_eq(v2_value_count(f, "brak"), 0)
+            assert_eq(v2_value_at(f, "jadro", 5), "")
+            assert_eq(v2_value_at(f, "jadro", -1), "")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_v3_any_order() is
+    match parse("[\n--> a.hacker\n-> opis\n=> cli\n= nazwa\n]") is
+        option::Result::Ok(f) => is
+            assert_eq(version(f), 3)
+            assert_eq(v3_header(f), "nazwa")
+            assert_eq(v3_type(f), "cli")
+            assert_eq(v3_description(f), "opis")
+            assert_eq(v3_file(f), "a.hacker")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_v3_incomplete_falls_back_to_v1() is
+    match parse("[\n= nazwa\n=> cli\n]") is
+        option::Result::Ok(f) => is
+            assert_eq(version(f), 1)
+            assert_eq(v1_content(f), "= nazwa\n=> cli")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_v3_duplicate_field_falls_back_to_v1() is
+    match parse("[\n= a\n= b\n=> t\n-> d\n--> f\n]") is
+        option::Result::Ok(f) => is
+            assert_eq(version(f), 1)
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_wrong_version_accessors_are_empty() is
+    match parse("[ 0.1 ]") is
+        option::Result::Ok(f) => is
+            assert_true(is_v1(f))
+            assert_false(is_v2(f))
+            assert_false(is_v3(f))
+            assert_eq(v2_header(f), "")
+            assert_eq(v2_section_count(f), 0)
+            assert_eq(v3_header(f), "")
+            assert_eq(v3_type(f), "")
+            assert_eq(v3_description(f), "")
+            assert_eq(v3_file(f), "")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_utf8_values_survive() is
+    match parse("[\nNagłówek żółć\nsekcja:\n= wartość ąę\n]") is
+        option::Result::Ok(f) => is
+            assert_eq(v2_header(f), "Nagłówek żółć")
+            assert_eq(v2_value_at(f, "sekcja", 0), "wartość ąę")
+        end
+        option::Result::Err(_) => is test::fail("parse failed") end
+    end
+end
+
+#[test]
+fn test_parse_file_missing() is
+    match parse_file("/nonexistent/definitely/missing.hacker") is
+        option::Result::Ok(_) => is test::fail("expected IoError") end
+        option::Result::Err(e) => is
+            assert_true(has_prefix(error_message(e), "Błąd I/O: "))
+        end
+    end
+end
